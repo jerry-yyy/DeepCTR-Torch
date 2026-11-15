@@ -62,6 +62,7 @@ class MMOE(BaseModel):
 
         self.num_experts = num_experts
         self.task_names = task_names
+        self.task_types = task_types
         self.input_dim = self.compute_input_dim(dnn_feature_columns)
         self.expert_dnn_hidden_units = expert_dnn_hidden_units
         self.gate_dnn_hidden_units = gate_dnn_hidden_units

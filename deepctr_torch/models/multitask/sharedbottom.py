@@ -56,6 +56,7 @@ class SharedBottom(BaseModel):
                 raise ValueError("task must be binary or regression, {} is illegal".format(task_type))
 
         self.task_names = task_names
+        self.task_types = task_types
         self.input_dim = self.compute_input_dim(dnn_feature_columns)
         self.bottom_dnn_hidden_units = bottom_dnn_hidden_units
         self.tower_dnn_hidden_units = tower_dnn_hidden_units

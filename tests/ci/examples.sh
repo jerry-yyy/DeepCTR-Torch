@@ -7,6 +7,7 @@ scripts=(
   "run_classification_criteo.py"
   "run_regression_movielens.py"
   "run_multitask_learning.py"
+  "run_multitask_mixed_movielens.py"
   "run_multivalue_movielens.py"
   "run_din.py"
   "run_dien.py"

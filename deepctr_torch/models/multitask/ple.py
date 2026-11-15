@@ -64,6 +64,7 @@ class PLE(BaseModel):
         self.shared_expert_num = shared_expert_num
         self.num_levels = num_levels
         self.task_names = task_names
+        self.task_types = task_types
         self.input_dim = self.compute_input_dim(dnn_feature_columns)
         self.expert_dnn_hidden_units = expert_dnn_hidden_units
         self.gate_dnn_hidden_units = gate_dnn_hidden_units
