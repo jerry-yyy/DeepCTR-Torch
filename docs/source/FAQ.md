@@ -77,3 +77,18 @@ model = DeepFM(...,device=device)
 ```python
 model = DeepFM(..., device=device, gpus=[0, 1])
 ```
+
+## 6. How to set different loss weights for the tasks of a multi-task model ?
+
+Pass `loss_weights` to `compile` together with one loss per task. It can be a list in the order of `task_names` or a
+dict keyed by task name. The training loss is `sum(loss_weights[t] * task_loss[t]) + regularization loss + auxiliary loss`.
+
+```python
+model = MMOE(dnn_feature_columns, task_types=['binary', 'regression'], task_names=['like', 'watch'])
+model.compile("adam", loss=["binary_crossentropy", "mse"], loss_weights={"like": 1.0, "watch": 0.2})
+```
+
+- `loss_weights=None` (default) keeps the previous behavior: every task has weight 1.
+- Weights are used as given (they are not normalized) and must be finite, non-negative and not all zero.
+- A weight of 0 removes the data loss of that task. Its parameters can still change through layers shared with other
+  tasks, regularization or weight decay.

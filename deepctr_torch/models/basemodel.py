@@ -227,6 +227,7 @@ class BaseModel(nn.Module):
         print("Train on {0} samples, validate on {1} samples, {2} steps per epoch".format(
             len(train_tensor_data), len(val_y), steps_per_epoch))
         num_tasks = getattr(self, "num_tasks", 1)
+        loss_weights = getattr(self, "loss_weights", None)
         for epoch in range(initial_epoch, epochs):
             callbacks.on_epoch_begin(epoch)
             epoch_logs = {}
@@ -248,8 +249,14 @@ class BaseModel(nn.Module):
                         if isinstance(loss_func, list):
                             assert len(loss_func) == num_tasks,\
                                 "the length of `loss_func` should be equal with `num_tasks`"
-                            loss = sum(
-                                [loss_func[i](y_pred[:, i], y[:, i], reduction=self.loss_reduction) for i in range(num_tasks)])
+                            if loss_weights is None:
+                                loss = sum(
+                                    [loss_func[i](y_pred[:, i], y[:, i], reduction=self.loss_reduction) for i in range(num_tasks)])
+                            else:
+                                # a task with weight 0 does not contribute to the data loss at all
+                                loss = sum(
+                                    [loss_weights[i] * loss_func[i](y_pred[:, i], y[:, i], reduction=self.loss_reduction)
+                                     for i in range(num_tasks) if loss_weights[i] != 0])
                         else:
                             y_for_loss = y
                             if y_for_loss.ndim > 1 and y_for_loss.shape[-1] == 1:
@@ -441,15 +448,21 @@ class BaseModel(nn.Module):
     def compile(self, optimizer,
                 loss=None,
                 metrics=None,
+                loss_weights=None,
                 ):
         """
         :param optimizer: String (name of optimizer) or optimizer instance. See [optimizers](https://pytorch.org/docs/stable/optim.html).
         :param loss: String (name of objective function) or objective function. See [losses](https://pytorch.org/docs/stable/nn.functional.html#loss-functions).
         :param metrics: List of metrics to be evaluated by the model during training and testing. Typically you will use `metrics=['accuracy']`.
+        :param loss_weights: Optional weights of the per-task losses of a multi-task model, only used when ``loss`` is a list with one loss per task.
+            Either a list in the order of ``task_names`` or a dict mapping every task name to its weight; ``None`` (default) weights every task by 1.
+            The training loss is ``sum(loss_weights[t] * task_loss[t]) + regularization loss + auxiliary loss``: weights are not normalized and do not scale the regularization or auxiliary loss.
+            Weights must be finite, non-negative and not all zero. A weight of 0 removes the data loss of that task; its parameters can still change through shared layers of other tasks, regularization or weight decay.
         """
         self.metrics_names = ["loss"]
         self.optim = self._get_optim(optimizer)
         self.loss_func = self._get_loss_func(loss)
+        self.loss_weights = self._get_loss_weights(loss_weights)
         self.metrics = self._get_metrics(metrics)
 
     def _get_optim(self, optimizer):
@@ -476,6 +489,43 @@ class BaseModel(nn.Module):
         else:
             loss_func = loss
         return loss_func
+
+    def _get_loss_weights(self, loss_weights):
+        if loss_weights is None:
+            return None
+        num_tasks = getattr(self, "num_tasks", 1)
+        if not isinstance(self.loss_func, list) or len(self.loss_func) != num_tasks:
+            raise ValueError("`loss_weights` needs per-task losses: `loss` should be a list with one loss for each "
+                             "of the {} task(s) of the model".format(num_tasks))
+        if isinstance(loss_weights, dict):
+            task_names = list(getattr(self, "task_names", []))
+            if len(set(task_names)) != len(task_names):
+                raise ValueError("`task_names` must be unique to use a dict of `loss_weights`, got {}".format(
+                    task_names))
+            if set(loss_weights) != set(task_names):
+                raise ValueError(
+                    "`loss_weights` should have exactly one weight for each task in {}, missing: {}, unknown: {}".format(
+                        task_names, [task_name for task_name in task_names if task_name not in loss_weights],
+                        [task_name for task_name in loss_weights if task_name not in task_names]))
+            loss_weights = [loss_weights[task_name] for task_name in task_names]
+        elif isinstance(loss_weights, (list, tuple)):
+            if len(loss_weights) != num_tasks:
+                raise ValueError("`loss_weights` should have {} weights (one for each task), got {}".format(
+                    num_tasks, len(loss_weights)))
+            loss_weights = list(loss_weights)
+        else:
+            raise ValueError("`loss_weights` should be None, a list or a dict, got {!r}".format(loss_weights))
+
+        for weight in loss_weights:
+            if isinstance(weight, bool) or not isinstance(weight, (int, float, np.integer, np.floating)):
+                raise ValueError("each loss weight must be a number, got {!r}".format(weight))
+            if not np.isfinite(weight):
+                raise ValueError("each loss weight must be finite, got {!r}".format(weight))
+            if weight < 0:
+                raise ValueError("each loss weight must be non-negative, got {!r}".format(weight))
+        if not any(weight > 0 for weight in loss_weights):
+            raise ValueError("`loss_weights` can not be all zero")
+        return [float(weight) for weight in loss_weights]
 
     def _get_loss_func_single(self, loss):
         if loss == "binary_crossentropy":

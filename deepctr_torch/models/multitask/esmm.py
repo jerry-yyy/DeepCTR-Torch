@@ -54,6 +54,9 @@ class ESMM(BaseModel):
             if task_type != 'binary':
                 raise ValueError("task must be binary in ESMM, {} is illegal".format(task_type))
 
+        self.task_names = task_names
+        self.task_types = task_types
+
         input_dim = self.compute_input_dim(dnn_feature_columns)
 
         self.ctr_dnn = DNN(input_dim, tower_dnn_hidden_units, activation=dnn_activation,
