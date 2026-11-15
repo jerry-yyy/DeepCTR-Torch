@@ -150,7 +150,10 @@ class BaseModel(nn.Module):
         :param callbacks: List of `deepctr_torch.callbacks.Callback` instances. List of callbacks to apply during training and validation. Now available: `EarlyStopping` , `ModelCheckpoint`
 
         :return: A `History` object. Its `History.history` attribute is a record of training loss values and metrics values at successive epochs, as well as validation loss values and validation metrics values (if applicable).
-            With per-task metrics (``metrics`` passed to ``compile`` as a dict), the training value of ``<task>_<metric>`` is computed once per epoch from all predictions made during that epoch (while the weights were still being updated), for every ``verbose`` level. It is therefore not the same quantity as ``evaluate`` on the final weights.
+            Training metrics are computed once per epoch on all the predictions made during that epoch (while the weights were still being updated), so they are not the same quantity as ``evaluate`` on the final weights.
+            They are not an average of per-batch values, hence a batch with a single class or a smaller last batch does not distort them.
+            To do so the labels and the float32 predictions of one epoch are kept in memory (with per-task metrics only the columns of the tasks that have metrics).
+            Metrics given as a list are only computed during training when ``verbose > 0``; per-task metrics (``metrics`` passed to ``compile`` as a dict) are computed for every ``verbose`` level.
         """
         if isinstance(x, dict):
             x = [x[feature] for feature in self.feature_index]
@@ -230,16 +233,22 @@ class BaseModel(nn.Module):
         print("Train on {0} samples, validate on {1} samples, {2} steps per epoch".format(
             len(train_tensor_data), len(val_y), steps_per_epoch))
         num_tasks = getattr(self, "num_tasks", 1)
-        # per-task metrics are computed once per epoch on all training predictions, whatever `verbose` is
-        task_metrics = getattr(self, "_metric_tasks", None) is not None and len(self.metrics) > 0
+        # Training metrics are computed once per epoch on the labels and predictions of the whole epoch.
+        # List metrics keep being skipped when verbose == 0, per-task metrics are always computed.
+        metric_tasks = getattr(self, "_metric_tasks", None)
+        if metric_tasks is None:
+            collect_metrics = verbose > 0 and len(self.metrics) > 0
+            metric_columns = None
+        else:
+            collect_metrics = len(self.metrics) > 0
+            metric_columns = sorted(set(metric_tasks.values()))  # only cache the tasks that have metrics
         for epoch in range(initial_epoch, epochs):
             callbacks.on_epoch_begin(epoch)
             epoch_logs = {}
             start_time = time.time()
             loss_epoch = 0
             total_loss_epoch = 0
-            train_result = {}
-            epoch_true, epoch_pred = [], []
+            epoch_true, epoch_pred, epoch_seen = None, None, 0
             try:
                 with tqdm(enumerate(train_loader), disable=verbose != 1) as t:
                     for _, (x_train, y_train) in t:
@@ -271,19 +280,18 @@ class BaseModel(nn.Module):
                         total_loss.backward()
                         optim.step()
 
-                        if task_metrics:
-                            epoch_true.append(y_train.numpy())
-                            epoch_pred.append(y_pred.cpu().data.numpy().astype("float64"))
-                        elif verbose > 0:
-                            for name, metric_fun in self.metrics.items():
-                                if name not in train_result:
-                                    train_result[name] = []
-                                y_true_metric, y_pred_metric = self._prepare_metric_inputs(
-                                    y.cpu().data.numpy(),
-                                    y_pred.cpu().data.numpy().astype("float64")
-                                )
-                                train_result[name].append(metric_fun(y_true_metric, y_pred_metric))
-
+                        if collect_metrics:
+                            y_true_batch = y_train.numpy()
+                            y_pred_batch = y_pred.cpu().data.numpy()
+                            if metric_columns is not None:
+                                y_true_batch = y_true_batch[:, metric_columns]
+                                y_pred_batch = y_pred_batch[:, metric_columns]
+                            if epoch_true is None:  # one buffer per epoch instead of a list of batches
+                                epoch_true = np.empty((sample_num,) + y_true_batch.shape[1:], y_true_batch.dtype)
+                                epoch_pred = np.empty((sample_num,) + y_pred_batch.shape[1:], y_pred_batch.dtype)
+                            epoch_true[epoch_seen:epoch_seen + len(y_true_batch)] = y_true_batch
+                            epoch_pred[epoch_seen:epoch_seen + len(y_pred_batch)] = y_pred_batch
+                            epoch_seen += len(y_true_batch)
 
             except KeyboardInterrupt:
                 t.close()
@@ -292,10 +300,8 @@ class BaseModel(nn.Module):
 
             # Add epoch_logs
             epoch_logs["loss"] = total_loss_epoch / sample_num
-            for name, result in train_result.items():
-                epoch_logs[name] = np.sum(result) / steps_per_epoch
-            if task_metrics:
-                epoch_logs.update(self._compute_metrics(np.concatenate(epoch_true), np.concatenate(epoch_pred)))
+            if collect_metrics:
+                epoch_logs.update(self._compute_metrics(epoch_true, epoch_pred, metric_columns))
 
             if do_validation:
                 eval_result = self.evaluate(val_x, val_y, batch_size)
@@ -454,6 +460,7 @@ class BaseModel(nn.Module):
         :param loss: String (name of objective function) or objective function. See [losses](https://pytorch.org/docs/stable/nn.functional.html#loss-functions).
         :param metrics: List of metrics to be evaluated by the model during training and testing. Typically you will use `metrics=['accuracy']`.
             For multi-task models a list is applied to the flattened labels and predictions of all tasks (one pooled value per metric).
+            ``auc`` is ``nan`` (with a warning) when the labels contain a single class.
             To get one value per task, pass a dict mapping task names to lists of metric names, e.g. ``{"like": ["auc", "logloss"], "watch": ["mse", "mae"]}``.
             Label columns follow the order of ``task_names`` (not the order of the dict) and results are named ``<task>_<metric>`` (``val_<task>_<metric>`` on validation data).
             Supported per-task metrics: ``auc``, ``logloss``/``binary_crossentropy``, ``accuracy``/``acc`` (binary tasks only), ``mse``, ``mae``.
@@ -531,7 +538,7 @@ class BaseModel(nn.Module):
                 if metric == "binary_crossentropy" or metric == "logloss":
                     metrics_[metric] = self._log_loss
                 if metric == "auc":
-                    metrics_[metric] = roc_auc_score
+                    metrics_[metric] = self._auc_score
                 if metric == "mse":
                     metrics_[metric] = mean_squared_error
                 if metric == "accuracy" or metric == "acc":
@@ -566,7 +573,7 @@ class BaseModel(nn.Module):
                     raise ValueError("per-task metrics must be given as string names, got {!r} for task '{}'".format(
                         metric, task_name))
                 if metric == "auc":
-                    metric_fun = partial(self._task_auc, task_name=task_name)
+                    metric_fun = partial(self._auc_score, task_name=task_name)
                 elif metric == "binary_crossentropy" or metric == "logloss":
                     metric_fun = partial(self._log_loss, labels=[0, 1])
                 elif metric == "accuracy" or metric == "acc":
@@ -591,31 +598,42 @@ class BaseModel(nn.Module):
         return metrics_
 
     @staticmethod
-    def _task_auc(y_true, y_pred, task_name):
+    def _auc_score(y_true, y_pred, task_name=None):
         if len(np.unique(y_true)) < 2:
-            warnings.warn("AUC of task '{}' is not defined because only one class is present in its labels, "
-                          "nan is returned".format(task_name))
+            warnings.warn("AUC{} is not defined because only one class is present in the labels, "
+                          "nan is returned".format("" if task_name is None else " of task '{}'".format(task_name)))
             return float("nan")
         return roc_auc_score(y_true, y_pred)
 
-    def _compute_metrics(self, y_true, y_pred):
+    def _compute_metrics(self, y_true, y_pred, columns=None):
+        """Compute all compiled metrics on complete label/prediction arrays.
+
+        :param columns: only for per-task metrics, the task indices kept (in this order) as columns of
+            ``y_true``/``y_pred``. ``None`` means one column for every task.
+        """
         metric_tasks = getattr(self, "_metric_tasks", None)
         if metric_tasks is None:
             result = {}
             for name, metric_fun in self.metrics.items():
                 y_true_metric, y_pred_metric = self._prepare_metric_inputs(y_true, y_pred)
-                result[name] = metric_fun(y_true_metric, y_pred_metric)
+                result[name] = metric_fun(y_true_metric, np.asarray(y_pred_metric, dtype="float64"))
             return result
 
         y_true = np.asarray(y_true)
         y_pred = np.asarray(y_pred)
-        for array_name, array in (("labels", y_true), ("predictions", y_pred)):
-            if array.ndim != 2 or array.shape[1] != self.num_tasks:
-                raise ValueError("per-task metrics expect {} of shape (num_samples, {}), i.e. {} columns ordered "
-                                 "as `task_names`, got shape {}".format(array_name, self.num_tasks, self.num_tasks,
-                                                                        array.shape))
-        return {name: metric_fun(y_true[:, metric_tasks[name]], y_pred[:, metric_tasks[name]])
-                for name, metric_fun in self.metrics.items()}
+        if columns is None:
+            columns = list(range(self.num_tasks))
+            for array_name, array in (("labels", y_true), ("predictions", y_pred)):
+                if array.ndim != 2 or array.shape[1] != self.num_tasks:
+                    raise ValueError("per-task metrics expect {} of shape (num_samples, {}), i.e. {} columns ordered "
+                                     "as `task_names`, got shape {}".format(array_name, self.num_tasks, self.num_tasks,
+                                                                            array.shape))
+        position = {task_index: i for i, task_index in enumerate(columns)}
+        result = {}
+        for name, metric_fun in self.metrics.items():
+            column = position[metric_tasks[name]]
+            result[name] = metric_fun(y_true[:, column], np.asarray(y_pred[:, column], dtype="float64"))
+        return result
 
     @staticmethod
     def _prepare_metric_inputs(y_true, y_pred):
