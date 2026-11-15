@@ -7,6 +7,7 @@ REQUIRED_PACKAGES = [
     'torch>=1.13.0; python_version < "3.8"',
     'torch>=2.4.0; python_version >= "3.8"',
     'tqdm',
+    'requests',
     'scikit-learn'
 ]
 
