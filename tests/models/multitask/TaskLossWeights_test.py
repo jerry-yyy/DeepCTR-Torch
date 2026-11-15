@@ -175,6 +175,23 @@ def test_regularization_is_added_once_and_not_scaled_by_task_weights():
     assert loss_large == pytest.approx(10.0 * task_losses[0] + 5.0 * task_losses[1] + reg, rel=1e-6)
 
 
+def test_auxiliary_loss_is_added_once_and_not_scaled_by_task_weights():
+    x, y, feature_columns = _data()
+
+    def logged_loss(weights):
+        model = _mmoe(feature_columns)
+        task_losses = [float(loss.item()) for loss in _reference_task_losses(copy.deepcopy(model), x, y)]
+        model.add_auxiliary_loss(torch.tensor([0.74]), 0.5)  # constant auxiliary loss of 0.37
+        model.compile(_sgd(model), loss=["binary_crossentropy", "mse"], loss_weights=weights)
+        return _fit_one_full_batch(model, x, y)["loss"][0], task_losses
+
+    loss_default, task_losses = logged_loss(None)
+    loss_weighted, _ = logged_loss([10.0, 5.0])
+
+    assert loss_default == pytest.approx(task_losses[0] + task_losses[1] + 0.37, rel=1e-6)
+    assert loss_weighted == pytest.approx(10.0 * task_losses[0] + 5.0 * task_losses[1] + 0.37, rel=1e-6)
+
+
 def test_loss_weights_respect_sum_reduction():
     x, y, feature_columns = _data()
     model = _mmoe(feature_columns)
