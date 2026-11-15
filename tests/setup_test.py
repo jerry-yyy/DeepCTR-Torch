@@ -16,3 +16,19 @@ def test_setup_py_does_not_depend_on_locale_encoding():
 
     assert process.returncode == 0, stderr.decode("utf-8", "replace")
     assert stdout.decode("utf-8", "replace").strip()
+
+
+def test_requests_is_a_declared_dependency():
+    # deepctr_torch/utils.py imports `requests` when the package is imported, so a plain
+    # `pip install deepctr-torch` must install it.
+    import ast
+
+    with open(os.path.join(REPO_ROOT, "setup.py"), "r", encoding="utf-8") as setup_file:
+        tree = ast.parse(setup_file.read())
+    required = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and getattr(node.targets[0], "id", None) == "REQUIRED_PACKAGES":
+            required = ast.literal_eval(node.value)
+
+    assert required is not None
+    assert any(requirement.split(";")[0].strip() == "requests" for requirement in required), required
